@@ -1,0 +1,216 @@
+# train.py begins
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import math
+import copy
+import numpy as np
+
+class TimeSeriesEmbedder(nn.Module):
+    def __init__(self, L, D):
+        super().__init__()
+        self.L = L
+        self.D = D
+        self.proj = nn.Linear(L * 3, D)
+
+    def forward(self, x):
+        B, T, _ = x.shape 
+        N = T // self.L    # window count
+        x = x[:, :N * self.L, :]    # get rid of leftover data
+        windows = x.reshape(B, N, self.L * 3)    # create flattened data
+        embeddings = self.proj(windows)   # embed with linear layer
+        return embeddings 
+
+class ContinuousPositionalEmbedding(nn.Module):
+    def __init__(self, D, max_freq=10000):
+        super().__init__()
+        div_term = torch.exp(torch.arange(0,D,2).float() * (-math.log(max_freq) / D))
+        self.register_buffer("w", div_term)
+
+    def forward(self, t):
+        PE = t.unsqueeze(-1) * self.w
+        PE = torch.cat([torch.sin(PE), torch.cos(PE)], dim=-1)
+        return PE
+
+class ChuaJEPA(nn.Module):
+    def __init__(self, L, D, n_heads=8, num_layers=6):
+        super().__init__()
+        self.ts_embedder = TimeSeriesEmbedder(L, D)
+        self.pos_embedder = ContinuousPositionalEmbedding(D)
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model= D, nhead=n_heads, batch_first=True) ## idk if 8 is appropriate
+        self.context_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers) # idk if 6 is good for this either
+        self.target_encoder = copy.deepcopy(self.context_encoder)
+
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
+
+        predictor_layer = nn.TransformerEncoderLayer(d_model=D, nhead=n_heads, batch_first=True)
+        self.prediction = nn.TransformerEncoder(predictor_layer, num_layers=num_layers // 2)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, D))
+
+    def forward(self, x, t):
+        h = self.ts_embedder(x)
+        t_embed = self.pos_embedder(t)
+        v = h + t_embed
+
+        B, N, D = v.shape
+        split_idx = N // 2
+
+        v_c = v[:, :split_idx, :] 
+        v_t = v[:, split_idx:, :]
+
+        context_pos = t_embed[:, :split_idx, :]
+        s_x = self.context_encoder(v_c) + context_pos
+        s_y = self.target_encoder(v_t)
+
+        mask_tokens = self.mask_token.expand(B, N - split_idx, D)
+        target_pos = t_embed[:, split_idx:, :]
+        target_setup = mask_tokens + target_pos
+
+        pred_in = torch.cat([s_x, target_setup], dim=1)
+        pred_out = self.prediction(pred_in)
+
+        s_y_hat = pred_out[:, split_idx:, :]
+
+        return s_y_hat, s_y
+
+def train_step(model, x, t, optimiser, tau=0.99):
+    s_y_hat, s_y = model(x, t)
+
+    loss = F.l1_loss(s_y_hat, s_y)
+
+    optimiser.zero_grad()
+    loss.backward()
+    optimiser.step()
+
+    with torch.no_grad():
+        for context_param, target_param in zip(model.context_encoder.parameters(), model.target_encoder.parameters()):
+            target_param.data.mul_(tau).add_(context_param.data, alpha=1.0 - tau)  # gemini recommended this method to apply computations directly to .data attribute and not mess with computational graph
+
+    return loss.item()
+
+### Generate chua data, taken from gemini ### 
+
+def generate_chua_batch(batch_size, total_steps, L, dt=0.05):
+    """Concise Chua generator. Simulates at 0.01s for stability, outputs at dt."""
+    inner_dt = 0.01
+    sim_steps = int(total_steps * (dt / inner_dt))
+    
+    states = np.random.uniform(-0.1, 0.1, (batch_size, 3))
+    states[:, 0] += 0.7
+    traj = []
+    
+    def f(s):
+        x, y, z = s[:,0], s[:,1], s[:,2]
+        fx = -0.714*x + 0.5*(-1.143 - -0.714)*(np.abs(x+1) - np.abs(x-1))
+        return np.stack([15.6*(y-x-fx), x-y+z, -28.0*y], axis=1)
+
+    for _ in range(sim_steps):
+        k1 = f(states)
+        k2 = f(states + 0.5 * inner_dt * k1)
+        k3 = f(states + 0.5 * inner_dt * k2)
+        k4 = f(states + inner_dt * k3)
+        states += (inner_dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        traj.append(states.copy())
+        
+    # Stack and downsample to the requested dt
+    traj = np.stack(traj, axis=1)[:, ::int(dt/inner_dt), :]
+    
+    # Generate timestamps
+    t_windows = torch.arange(total_steps // L, dtype=torch.float32) * (L * dt)
+    t_tensor = t_windows.unsqueeze(0).repeat(batch_size, 1)
+    
+    return torch.tensor(traj, dtype=torch.float32), t_tensor
+
+
+BATCH_SIZE = 32
+TOTAL_STEPS = 200
+L = 10       # time steps per window
+D = 128     # latent embedding dimension
+EPOCHS = 2000
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training on device: {device}")
+
+    model = ChuaJEPA(L=L, D=D, n_heads=8, num_layers=4).to(device) # initialise model
+    optimiser = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    loss_history = []
+
+    for epoch in range(EPOCHS):
+
+        x_batch, t_batch = generate_chua_batch(BATCH_SIZE, TOTAL_STEPS, L)
+        x_batch = x_batch.to(device)
+        t_batch = t_batch.to(device)
+        loss_val = train_step(model, x_batch, t_batch, optimiser, tau=0.996)
+
+        loss_history.append(loss_val)
+        
+        if epoch % 50 == 0:
+            print(f"Epoch {epoch} | Loss: {loss_val:.4f}")
+
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(loss_history, color='teal', linewidth=2)
+    plt.title("JEPA Latent Loss on Chua's Circuit")
+    plt.xlabel("Epoch")
+    plt.ylabel("L1 Loss")
+    plt.yscale('log')  # Log scale helps visualize the convergence tail
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.show()
+
+    torch.save(model.state_dict(), "chua_jepa.pth")
+    print("Model saved to chua_jepa.pth")
+
+# train.py ends
+
+# evaluate.py begins
+
+import torch
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
+from train import ChuaJEPA, generate_chua_batch, L, D
+
+print("Load model and visualise with PCA")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = ChuaJEPA(L=L, D=D, n_heads=8, num_layers=4)
+
+model.load_state_dict(torch.load("chua_jepa.pth", map_location=device, weights_only=True))
+model.to(device)
+model.eval()
+
+with torch.no_grad():
+    x_test, t_test = generate_chua_batch(1, 10000, L)
+    x_test, t_test = x_test.to(device), t_test.to(device)
+    
+    s_y_hat, s_y = model(x_test, t_test)
+    
+    s_y_np = s_y.squeeze(0).cpu().numpy()
+    s_y_hat_np = s_y_hat.squeeze(0).cpu().numpy()
+
+pca = PCA(n_components=3)
+true_3d = pca.fit_transform(s_y_np)
+
+pred_3d = pca.transform(s_y_hat_np)
+
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+
+ax.plot(true_3d[:, 0], true_3d[:, 1], true_3d[:, 2], 
+        color='blue', label='True Encoded Future', lw=2)
+
+ax.plot(pred_3d[:, 0], pred_3d[:, 1], pred_3d[:, 2], 
+        color='red', label='Predicted Future', lw=2, linestyle='--')
+
+ax.set_title("JEPA Predictor vs Target in Latent Space")
+ax.legend()
+plt.show()
+
+# evaluate.py ends
